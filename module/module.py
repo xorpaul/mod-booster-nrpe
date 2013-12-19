@@ -153,13 +153,20 @@ class NRPE:
             self.message = "Error : cannot read output from nrpe daemon..."
             return (self.rc, self.message)
 
+        logger.info("[NRPEPoller] response from NRPE daemon on the client: %s" % str(response))
+
+        nrpe_packet_type = 2
+        if response[1] == 3:
+          logger.info("[NRPEPoller] found NRPE response type RESPONSE_PACKET_WITH_MORE")
+          nrpe_packet_type = response[1]
+
         self.rc = response[3]
         # the output is padded with \x00 at the end so
         # we remove it.
         self.message = re.sub('\x00.*$', '', response[4])
         crc_orig = response[2]
 
-        return (self.rc, self.message)
+        return (self.rc, self.message, nrpe_packet_type)
 
 
 class NRPEAsyncClient(asyncore.dispatcher):
@@ -263,7 +270,17 @@ class NRPEAsyncClient(asyncore.dispatcher):
             # Maybe we got nothing from the server (it refused our IP,
             # or our arguments...)
             if len(buf) != 0:
-                (rc, message) = self.nrpe.read(buf)
+                nrpe_packet_type = 2
+                self.message, message_buffer = '', ''
+                (rc, message_buffer, nrpe_packet_type) = self.nrpe.read(buf)
+                logger.info("[NRPEPoller] found NRPE packet type %s" % str(nrpe_packet_type))
+                self.message += message_buffer
+                while nrpe_packet_type == 3:
+                    logger.info("[NRPEPoller] continuing reading response...")
+                    (rc, message_buffer, nrpe_packet_type) = self.nrpe.handle_read()
+                    logger.info("[NRPEPoller] appending to response %s" % str(message_buffer))
+                    self.message += message_buffer
+                logger.info("[NRPEPoller] got response message %s" % str(self.message))
                 self.set_exit(rc, message)
             else:
                 self.set_exit(2, "Error : Empty response from the NRPE server")
