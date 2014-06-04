@@ -139,31 +139,37 @@ class NRPE:
 
     # Read a return and extract return code
     # and output
-    def read(self, data):
+    def read(self, data, recurse=False):
         if self.state == 'received':
             return (self.rc, self.message)
 
-        self.state = 'received'
         # TODO: check crc
 
         try:
-            response = struct.unpack(">2hih1024s", data)
-        except:  # bad format...
+            if recurse:
+                logger.info("[NRPEPoller] data: %s" % str(data.__len__()))
+                response = struct.unpack(">2hih1024s", data)
+            else:
+                response = struct.unpack(">2hih1024s", data)
+        except struct.error as e:  # bad format...
             self.rc = 3
             self.message = "Error : cannot read output from nrpe daemon..."
-            return (self.rc, self.message)
+            logger.info("[NRPEPoller] struct.unpack error: %s" % str(e))
+            logger.info("[NRPEPoller] bad binary data format: %s" % str(data))
+            return (self.rc, self.message, 2)
 
-        logger.info("[NRPEPoller] response from NRPE daemon on the client: %s" % str(response))
 
+        #logger.info("[NRPEPoller] response from NRPE daemon on the client: %s" % str(response))
         nrpe_packet_type = 2
+        self.state = 'received'
         if response[1] == 3:
-          logger.info("[NRPEPoller] found NRPE response type RESPONSE_PACKET_WITH_MORE")
-          nrpe_packet_type = response[1]
+            self.state = 'unfinished'
+            nrpe_packet_type = response[1]
 
         self.rc = response[3]
-        # the output is padded with \x00 at the end so
-        # we remove it.
-        self.message = re.sub('\x00.*$', '', response[4])
+        # the output is fill with \x00 at the end. We
+        # should clean them
+        self.message = response[4].strip('\x00')
         crc_orig = response[2]
 
         return (self.rc, self.message, nrpe_packet_type)
@@ -234,10 +240,10 @@ class NRPEAsyncClient(asyncore.dispatcher):
             message = 'Error : connection timeout after %d seconds' % self.timeout
             self.set_exit(rc, message)
 
-    # We got a read from the socket and keep receiving until it has
+    # We got a read for the socket. We do it if we do not already
     # finished. Maybe it's just a SSL handshake continuation, if so
     # we continue it and wait for handshake finish
-    def handle_read(self):
+    def handle_read(self, recurse=False):
         if not self.is_done():
             try:
                 buf = self.recv(1034)
@@ -257,7 +263,7 @@ class NRPEAsyncClient(asyncore.dispatcher):
                 return
 
             # We can have nothing, it's just that the server
-            # does not want to talk to us :(
+            # do not want to talk to us :(
             except SSLZeroReturnError:
                 buf = ''
 
@@ -267,23 +273,31 @@ class NRPEAsyncClient(asyncore.dispatcher):
             except SSLError:
                 buf = ''
 
-            # Maybe we got nothing from the server (it refused our IP,
-            # or our arguments...)
+            # Maybe we got nothing from the server (it refuse our ip,
+            # or refuse arguments...)
             if len(buf) != 0:
-                nrpe_packet_type = 2
-                self.message, message_buffer = '', ''
-                (rc, message_buffer, nrpe_packet_type) = self.nrpe.read(buf)
-                logger.info("[NRPEPoller] found NRPE packet type %s" % str(nrpe_packet_type))
-                self.message += message_buffer
-                while nrpe_packet_type == 3:
-                    logger.info("[NRPEPoller] continuing reading response...")
-                    (rc, message_buffer, nrpe_packet_type) = self.nrpe.handle_read()
-                    logger.info("[NRPEPoller] appending to response %s" % str(message_buffer))
-                    self.message += message_buffer
-                logger.info("[NRPEPoller] got response message %s" % str(self.message))
-                self.set_exit(rc, message)
+                logger.info("[NRPEPoller] buf: %s" % str(buf.__len__()))
+                (rc, message, nrpe_packet_type) = self.nrpe.read(buf)
+                #logger.info("[NRPEPoller] message: %s" % str(message))
+                if nrpe_packet_type == 3:
+                    logger.info("[NRPEPoller] found NRPE response type RESPONSE_PACKET_WITH_MORE in handle_read")
+                    buf2 = self.recv(1034)
+                    logger.info("[NRPEPoller] buf2: %s" % str(buf2.__len__()))
+                    # XXX for some reason this returns only 2 :/ *sadface*
+                    test = self.nrpe.read(buf2, True)
+                    logger.info("[NRPEPoller] test: %s" % str(test))
+                    #logger.info("[NRPEPoller] appending to response %s" % str(message_buffer))
+                    #message += message_buffer[1]
+                    #if message_buffer[2] == 2:
+                    #    self.set_exit(rc, message)
+                    #return message
+                #elif recurse:
+                #    logger.info("[NRPEPoller] appending to response %s" % str(message))
+                #    return message
+                else:
+                    self.set_exit(rc, message)
             else:
-                self.set_exit(2, "Error : Empty response from the NRPE server")
+                self.set_exit(2, "Error : nothing return from the nrpe server")
 
             # We can close the socket, we are done
             self.close()
@@ -367,13 +381,13 @@ class Nrpe_poller(BaseModule):
     def __init__(self, mod_conf):
         BaseModule.__init__(self, mod_conf)
 
-    # Called by poller to say 'get ready'
+    # Called by poller to say 'let's prepare yourself guy'
     def init(self):
         logger.info("[NRPEPoller] Initialization of the nrpe poller module")
         self.i_am_dying = False
 
     # Get new checks if less than nb_checks_max
-    # If we get no new checks and there are no checks in the queue,
+    # If no new checks got and no check in queue,
     # sleep for 1 sec
     # REF: doc/shinken-action-queues.png (3)
     def get_new_checks(self):
@@ -398,7 +412,7 @@ class Nrpe_poller(BaseModule):
                 chk.status = 'launched'
                 chk.check_time = now
 
-                # We want the args of the commands so we parse it like a shell
+                # Want the args of the commands so we parse it like a shell
                 # shlex want str only
                 clean_command = shlex.split(chk.command.encode('utf8', 'ignore'))
 
@@ -491,7 +505,7 @@ class Nrpe_poller(BaseModule):
         except Exception, exp:
             output = cStringIO.StringIO()
             traceback.print_exc(file=output)
-            logger.error("Worker '%d' exit with an unmanaged exception : %s" % (self.id, output.getvalue()))
+            logger.error("NRPE exited with an unmanaged exception : %s" % output.getvalue())
             output.close()
             # Ok I die now
             raise
@@ -533,7 +547,7 @@ class Nrpe_poller(BaseModule):
             try:
                 cmsg = c.get(block=False)
                 if cmsg.get_type() == 'Die':
-                    logger.info("[NRPEPoller] Dad says we should die...")
+                    logger.info("[NRPEPoller] Dad say we are dying...")
                     break
             except:
                 pass
