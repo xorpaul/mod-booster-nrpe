@@ -179,7 +179,9 @@ class NRPEAsyncClient(asyncore.dispatcher):
 
     def __init__(self, host, port, use_ssl, timeout, unknown_on_timeout, msg):
         asyncore.dispatcher.__init__(self)
+        #super(NRPEAsyncClient, self).__init__()
 
+        self.foo = ''
         self.use_ssl = use_ssl
         self.start_time = time.time()
         self.timeout = timeout
@@ -221,11 +223,20 @@ class NRPEAsyncClient(asyncore.dispatcher):
     def handle_close(self):
         self.close()
 
-    def set_exit(self, rc, message):
+    def set_exit(self, rc, message, nrpe_packet_type=2):
+        logger.info("[NRPEPoller] nrpe_packet_type: %i" % nrpe_packet_type)
         self.rc = rc
-        self.message = message
+        if nrpe_packet_type == 3:
+            logger.info("[NRPEPoller] appending to self.foo %s" % str(message))
+            self.foo += message
+            self.nrpe.state = 'unfinished'
+        else:
+            if self.foo != '':
+                logger.info("[NRPEPoller] merging %s AAAAAAAAAAAAAAAAAAAAAAAAAAANNNNNNNNNNNNNNNNNNNNNDDDDDDDDD %s" % (str(self.foo), str(message)))
+                message = self.foo + message
+            self.message = message
+            self.nrpe.state = 'received'
         self.execution_time = time.time() - self.start_time
-        self.nrpe.state = 'received'
 
     # Check if we are in timeout. If so, just bailout
     # and set the correct return code from timeout
@@ -243,7 +254,7 @@ class NRPEAsyncClient(asyncore.dispatcher):
     # We got a read for the socket. We do it if we do not already
     # finished. Maybe it's just a SSL handshake continuation, if so
     # we continue it and wait for handshake finish
-    def handle_read(self, recurse=False):
+    def handle_read(self):
         if not self.is_done():
             try:
                 buf = self.recv(1034)
@@ -257,6 +268,7 @@ class NRPEAsyncClient(asyncore.dispatcher):
             # it, sorry
             except SSLWantReadError, exp:
                 try:
+                    logger.info("[NRPEPoller] do_handshake()")
                     self.socket.do_handshake()
                 except SSLWantReadError, exp:
                     return
@@ -276,31 +288,33 @@ class NRPEAsyncClient(asyncore.dispatcher):
             # Maybe we got nothing from the server (it refuse our ip,
             # or refuse arguments...)
             if len(buf) != 0:
-                logger.info("[NRPEPoller] buf: %s" % str(buf.__len__()))
+                logger.info("[NRPEPoller] state %s" % str(self.nrpe.state))
+                logger.info("[NRPEPoller] buf %s" % str(buf.__len__()))
                 (rc, message, nrpe_packet_type) = self.nrpe.read(buf)
-                #logger.info("[NRPEPoller] message: %s" % str(message))
-                if nrpe_packet_type == 3:
-                    logger.info("[NRPEPoller] found NRPE response type RESPONSE_PACKET_WITH_MORE in handle_read")
-                    buf2 = self.recv(1034)
-                    logger.info("[NRPEPoller] buf2: %s" % str(buf2.__len__()))
-                    # XXX for some reason this returns only 2 :/ *sadface*
-                    test = self.nrpe.read(buf2, True)
-                    logger.info("[NRPEPoller] test: %s" % str(test))
-                    #logger.info("[NRPEPoller] appending to response %s" % str(message_buffer))
-                    #message += message_buffer[1]
-                    #if message_buffer[2] == 2:
-                    #    self.set_exit(rc, message)
-                    #return message
+                logger.info("[NRPEPoller] message: %s" % str(message))
+                #if nrpe_packet_type == 3:
+                #    logger.info("[NRPEPoller] found NRPE response type RESPONSE_PACKET_WITH_MORE in handle_read")
+                #    buf2 = self.recv(1024)
+                #    logger.info("[NRPEPoller] buf2 value: %s" % str(buf2))
+                #    logger.info("[NRPEPoller] buf2: %s" % str(buf2.__len__()))
+                #    # XXX for some reason this returns only 2 :/ *sadface*
+                #    test = self.nrpe.read(buf2, True)
+                #    logger.info("[NRPEPoller] test: %s" % str(test))
+                #    #logger.info("[NRPEPoller] appending to response %s" % str(message_buffer))
+                #    #message += message_buffer[1]
+                #    #if message_buffer[2] == 2:
+                #    #    self.set_exit(rc, message)
+                #    #return message
                 #elif recurse:
                 #    logger.info("[NRPEPoller] appending to response %s" % str(message))
                 #    return message
-                else:
-                    self.set_exit(rc, message)
+                self.set_exit(rc, message, nrpe_packet_type)
             else:
                 self.set_exit(2, "Error : nothing return from the nrpe server")
 
-            # We can close the socket, we are done
-            self.close()
+            if nrpe_packet_type != 3:
+                # We can close the socket, we are done
+                self.close()
 
     # Did we finished our job?
     def writable(self):
@@ -449,7 +463,7 @@ class Nrpe_poller(BaseModule):
 
         # First look for checks in timeout
         for c in self.checks:
-            if c.status == 'launched':
+            if c.status == 'launched' and c.status != 'unfinished':
                 c.con.look_for_timeout()
 
         # We check if all new things in connections
